@@ -1,104 +1,93 @@
 #include <Wire.h>
 #include <Servo.h>
 
-const int MPU = 0x68; 
+#define MPU_ADDR 0x68
 Servo massServo;
 
-// --- Control Variables ---
+// --- Config & Flags ---
 bool enablePID = true;
 bool enableWheels = false;
+bool showDebug = false; // CMD 's' to toggle serial printing
 
-float Kp = 12.0, Ki = 0.0, Kd = 0.5; // Default PID
-float targetAngle = -1.5; 
-float pitch = 0, error, lastError, integral;
-unsigned long lastTime;
+float Kp = 12.0, Ki = 0.0, Kd = 0.5;
+float pitch = 0, targetAngle = -1.5;
+float lastError = 0, integral = 0;
+unsigned long lastMicros;
 
 void setup() {
-  Wire.begin();
-  Wire.beginTransmission(MPU);
-  Wire.write(0x6B); 
-  Wire.write(0);    
-  Wire.endTransmission(true);
-  
-  massServo.attach(9);
   Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000); // 400kHz I2C Fast Mode
   
-  Serial.println("--- 2-Wheeled Biped Tuner ---");
-  Serial.println("Commands: 'p1.5' (set Kp), 'i0.1' (set Ki), 'd0.5' (set Kd)");
-  Serial.println("'e1' (Enable PID), 'e0' (Disable PID)");
-  Serial.println("'w1' (Enable Wheels), 'w0' (Disable Wheels)");
-  
-  lastTime = millis();
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission();
+
+  massServo.attach(9);
+  lastMicros = micros();
 }
 
 void loop() {
-  float dt = (millis() - lastTime) / 1000.0;
-  lastTime = millis();
+  // 1. Calculate precise Delta Time
+  unsigned long currentMicros = micros();
+  float dt = (currentMicros - lastMicros) / 1000000.0;
+  lastMicros = currentMicros;
 
-  // 1. Read MPU6050 & Filter
-  readIMU(dt);
+  // 2. High-Speed IMU Read (Direct Register Access)
+  readIMU_Fast(dt);
 
-  // 2. Serial Tuning Parser
-  checkSerial();
+  // 3. Non-Blocking Serial Parser
+  if (Serial.available()) handleSerial();
 
-  // 3. PID Calculation
+  // 4. PID Controller
   if (enablePID) {
-    error = pitch - targetAngle;
+    float error = pitch - targetAngle;
     integral += error * dt;
     float derivative = (error - lastError) / dt;
     float output = (Kp * error) + (Ki * integral) + (Kd * derivative);
     lastError = error;
 
-    // Actuate Servo
-    int servoPos = constrain(90 + output, 30, 150);
-    massServo.write(servoPos);
+    massServo.write(constrain(90 + (int)output, 30, 150));
+    if (enableWheels) driveMotors(output * 10);
+  }
 
-    // Actuate Wheels (Only if enabled)
-    if (enableWheels) {
-      driveMotors(output * 10); // Simple proportional drive
-    } else {
-      driveMotors(0);
+  // 5. Conditional Telemetry (The "Silent" Mode)
+  if (showDebug) {
+    // Only prints every 50ms to save CPU
+    static unsigned long lastPrint;
+    if (millis() - lastPrint > 50) {
+      Serial.print(pitch); Serial.print(",");
+      Serial.print(Kp); Serial.print(",");
+      Serial.println(enableWheels);
+      lastPrint = millis();
     }
   }
-
-  // 4. Print Telemetry for Plotting
-  Serial.print("Pitch:"); Serial.print(pitch);
-  Serial.print(" | Kp:"); Serial.print(Kp);
-  Serial.print(" | PID_En:"); Serial.print(enablePID);
-  Serial.print(" | Wheel_En:"); Serial.println(enableWheels);
-
-  delay(10); 
 }
 
-void readIMU(float dt) {
-  int16_t AcY, AcZ, GyX;
-  Wire.beginTransmission(MPU);
-  Wire.write(0x3D); // Start at Accel Y
+void readIMU_Fast(float dt) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3D); // Start at Accel_Y
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU, 6, true);
-  
-  AcY = Wire.read() << 8 | Wire.read();
-  AcZ = Wire.read() << 8 | Wire.read();
-  GyX = Wire.read() << 8 | Wire.read();
+  Wire.requestFrom(MPU_ADDR, 6, true);
 
-  float accelAngle = atan2(AcY, AcZ) * 180 / PI;
-  float gyroRate = GyX / 131.0;
-  pitch = 0.98 * (pitch + gyroRate * dt) + 0.02 * accelAngle;
+  int16_t ay = Wire.read() << 8 | Wire.read();
+  int16_t az = Wire.read() << 8 | Wire.read();
+  int16_t gx = Wire.read() << 8 | Wire.read();
+
+  float accelAngle = atan2(ay, az) * 57.295; // 180/PI
+  float gyroRate = gx / 131.0;
+  // Alpha 0.99 for higher stability during walking vibrations
+  pitch = 0.99 * (pitch + gyroRate * dt) + 0.01 * accelAngle;
 }
 
-void checkSerial() {
-  if (Serial.available() > 0) {
-    char type = Serial.read();
-    float val = Serial.parseFloat();
-
-    if (type == 'p') Kp = val;
-    else if (type == 'i') Ki = val;
-    else if (type == 'd') Kd = val;
-    else if (type == 'e') enablePID = (val > 0.5);
-    else if (type == 'w') enableWheels = (val > 0.5);
-  }
+void handleSerial() {
+  char cmd = Serial.read();
+  if (cmd == 's') showDebug = !showDebug;
+  if (cmd == 'e') enablePID = !enablePID;
+  if (cmd == 'w') enableWheels = !enableWheels;
+  if (cmd == 'p') Kp = Serial.parseFloat(); // Still used for tuning, but doesn't run every loop
 }
 
-void driveMotors(float speed) {
-  // Add your H-Bridge PWM logic here
-}
+void driveMotors(float speed) { /* PWM Logic */ }
