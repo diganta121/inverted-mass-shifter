@@ -4,63 +4,57 @@
 #define MPU_ADDR 0x68
 Servo massServo;
 
-// --- Config & Flags ---
-bool enablePID = true;
-bool enableWheels = false;
-bool showDebug = false; // CMD 's' to toggle serial printing
+// --- Config Flags ---
+bool enablePID = true, enableWheels = false, showDebug = false;
+int8_t axisSelect = 1; // 1:X, 2:Y, 3:Z
+int8_t invertAxis = 1; // 1 or -1
 
-float Kp = 12.0, Ki = 0.0, Kd = 0.5;
-float pitch = 0, targetAngle = -1.5;
+// --- PID & IMU Vars ---
+float Kp = 15.0, Ki = 0.1, Kd = 0.6;
+float pitch = 0, targetAngle = 0, offset = 0;
 float lastError = 0, integral = 0;
 unsigned long lastMicros;
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
-  Wire.setClock(400000); // 400kHz I2C Fast Mode
+  Wire.setClock(400000); 
   
-  // Wake up MPU6050
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0);
+  Wire.write(0x6B); Wire.write(0); 
   Wire.endTransmission();
 
   massServo.attach(9);
   lastMicros = micros();
+  Serial.println("System Ready. Commands: 'c' Calibrate, 'a[1-3]' Axis, 'v' Invert, 's' Toggle Serial");
 }
 
 void loop() {
-  // 1. Calculate precise Delta Time
   unsigned long currentMicros = micros();
   float dt = (currentMicros - lastMicros) / 1000000.0;
   lastMicros = currentMicros;
 
-  // 2. High-Speed IMU Read (Direct Register Access)
   readIMU_Fast(dt);
 
-  // 3. Non-Blocking Serial Parser
   if (Serial.available()) handleSerial();
 
-  // 4. PID Controller
   if (enablePID) {
-    float error = pitch - targetAngle;
+    float error = (pitch - targetAngle);
     integral += error * dt;
     float derivative = (error - lastError) / dt;
     float output = (Kp * error) + (Ki * integral) + (Kd * derivative);
     lastError = error;
 
-    massServo.write(constrain(90 + (int)output, 30, 150));
+    massServo.write(constrain(90 + (int)output, 0, 180));
     if (enableWheels) driveMotors(output * 10);
   }
 
-  // 5. Conditional Telemetry (The "Silent" Mode)
   if (showDebug) {
-    // Only prints every 50ms to save CPU
     static unsigned long lastPrint;
-    if (millis() - lastPrint > 50) {
-      Serial.print(pitch); Serial.print(",");
-      Serial.print(Kp); Serial.print(",");
-      Serial.println(enableWheels);
+    if (millis() - lastPrint > 40) {
+      Serial.print("P:"); Serial.print(pitch);
+      Serial.print(" Ax:"); Serial.print(axisSelect);
+      Serial.print(" Inv:"); Serial.println(invertAxis);
       lastPrint = millis();
     }
   }
@@ -68,26 +62,52 @@ void loop() {
 
 void readIMU_Fast(float dt) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3D); // Start at Accel_Y
+  Wire.write(0x3B); // Start at Accel_X
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 6, true);
+  Wire.requestFrom(MPU_ADDR, 14, true); // Read all axes
 
-  int16_t ay = Wire.read() << 8 | Wire.read();
-  int16_t az = Wire.read() << 8 | Wire.read();
-  int16_t gx = Wire.read() << 8 | Wire.read();
+  int16_t data[7]; // ax, ay, az, temp, gx, gy, gz
+  for(int i=0; i<7; i++) data[i] = Wire.read() << 8 | Wire.read();
 
-  float accelAngle = atan2(ay, az) * 57.295; // 180/PI
-  float gyroRate = gx / 131.0;
-  // Alpha 0.99 for higher stability during walking vibrations
-  pitch = 0.99 * (pitch + gyroRate * dt) + 0.01 * accelAngle;
+  // Select axis based on user input
+  float rawAccel, rawGyro;
+  if(axisSelect == 1) { rawAccel = atan2(data[1], data[2]); rawGyro = data[4]/131.0; }
+  else if(axisSelect == 2) { rawAccel = atan2(data[0], data[2]); rawGyro = data[5]/131.0; }
+  else { rawAccel = atan2(data[0], data[1]); rawGyro = data[6]/131.0; }
+
+  float accelAngle = (rawAccel * 57.295) - offset;
+  pitch = 0.99 * (pitch + (rawGyro * invertAxis) * dt) + 0.01 * accelAngle;
+}
+
+void calibrateIMU() {
+  Serial.println("Calibrating... Keep robot still.");
+  float sum = 0;
+  for(int i=0; i<200; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x3B); Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 6, true);
+    int16_t ax = Wire.read()<<8|Wire.read();
+    int16_t ay = Wire.read()<<8|Wire.read();
+    int16_t az = Wire.read()<<8|Wire.read();
+    sum += (axisSelect == 1) ? atan2(ay, az)*57.295 : atan2(ax, az)*57.295;
+    delay(5);
+  }
+  offset = sum / 200.0;
+  pitch = 0; // Reset integration
+  Serial.print("New Offset: "); Serial.println(offset);
 }
 
 void handleSerial() {
   char cmd = Serial.read();
-  if (cmd == 's') showDebug = !showDebug;
-  if (cmd == 'e') enablePID = !enablePID;
-  if (cmd == 'w') enableWheels = !enableWheels;
-  if (cmd == 'p') Kp = Serial.parseFloat(); // Still used for tuning, but doesn't run every loop
+  switch(cmd) {
+    case 'c': calibrateIMU(); break;
+    case 's': showDebug = !showDebug; break;
+    case 'v': invertAxis *= -1; break;
+    case 'a': axisSelect = Serial.parseInt(); break;
+    case 'p': Kp = Serial.parseFloat(); break;
+    case 'e': enablePID = !enablePID; break;
+    case 'w': enableWheels = !enableWheels; break;
+  }
 }
 
-void driveMotors(float speed) { /* PWM Logic */ }
+void driveMotors(float speed) { /* Motor Logic */ }
